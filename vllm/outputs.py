@@ -58,7 +58,7 @@ class CompletionOutput:
                 f"cumulative_logprob={self.cumulative_logprob}, "
                 f"logprobs={self.logprobs}, "
                 f"finish_reason={self.finish_reason}, "
-                f"stop_reason={self.stop_reason})")
+                f"stop_reason={self.stop_reason},")
 
 
 @dataclass
@@ -118,6 +118,8 @@ class RequestOutput:
         *,
         multi_modal_placeholders: Optional[MultiModalPlaceholderDict] = None,
         kv_transfer_params: Optional[dict[str, Any]] = None,
+        aux_hidden_states:Optional[torch.Tensor]=None,
+        hidden_states:Optional[torch.Tensor]=None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -138,7 +140,8 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
-
+        self.aux_hidden_states=aux_hidden_states
+        self.hidden_states=hidden_states
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
@@ -175,6 +178,7 @@ class RequestOutput:
         cls, seq_group: SequenceGroup, use_cache: bool,
         seq_id_to_seq_group: dict[str, SequenceGroupBase]
     ) -> Optional["RequestOutput"]:
+
         finished = seq_group.is_finished()
 
         if seq_group.request_id in seq_id_to_seq_group:
@@ -335,6 +339,7 @@ class RequestOutput:
         return request_output
 
     def __repr__(self) -> str:
+
         return (f"RequestOutput(request_id={self.request_id}, "
                 f"prompt={self.prompt!r}, "
                 f"prompt_token_ids={self.prompt_token_ids}, "
@@ -346,7 +351,9 @@ class RequestOutput:
                 f"metrics={self.metrics}, "
                 f"lora_request={self.lora_request}, "
                 f"num_cached_tokens={self.num_cached_tokens}, "
-                f"multi_modal_placeholders={self.multi_modal_placeholders})")
+                f"multi_modal_placeholders={self.multi_modal_placeholders}, "
+                f"aux_hidden_states={self.aux_hidden_states}, "
+                f"hidden_states={self.hidden_states})")
 
 
 _O = TypeVar("_O", default=PoolingOutput)
