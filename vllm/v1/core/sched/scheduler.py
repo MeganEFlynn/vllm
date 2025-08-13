@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any, Optional, Union
-
+import numpy as np
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.factory import (
@@ -34,7 +34,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
-
+import torch
 logger = init_logger(__name__)
 
 
@@ -756,8 +756,10 @@ class Scheduler(SchedulerInterface):
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
-        num_nans_in_logits = model_runner_output.num_nans_in_logits
 
+        num_nans_in_logits = model_runner_output.num_nans_in_logits
+        aux_hidden_states=model_runner_output.aux_hidden_states
+        hidden_states=model_runner_output.hidden_states
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
 
@@ -854,7 +856,8 @@ class Scheduler(SchedulerInterface):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None \
                 or kv_transfer_params:
-
+                if len(aux_hidden_states)>0:
+                    aux_hidden_states=torch.cat(aux_hidden_states, dim=1)
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -868,6 +871,9 @@ class Scheduler(SchedulerInterface):
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
                         num_cached_tokens=request.num_cached_tokens,
+                        aux_hidden_states=aux_hidden_states,
+                        hidden_states=hidden_states
+
                     ))
 
             else:

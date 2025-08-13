@@ -168,6 +168,8 @@ class RequestState:
         stop_reason: Union[int, str, None],
         kv_transfer_params: Optional[dict[str, Any]] = None,
         num_cached_tokens: int = 0,
+        aux_hidden_states:Optional[torch.Tensor]=None,
+        hidden_states:Optional[torch.Tensor]=None,
     ) -> Optional[Union[RequestOutput, PoolingRequestOutput]]:
 
         finished = finish_reason is not None
@@ -195,7 +197,7 @@ class RequestState:
                 return None
 
         return self._new_request_output(request_id, outputs, finished,
-                                        kv_transfer_params, num_cached_tokens)
+                                        kv_transfer_params, num_cached_tokens, aux_hidden_states, hidden_states)
 
     def _new_request_output(
         self,
@@ -204,6 +206,8 @@ class RequestState:
         finished: bool,
         kv_transfer_params: Optional[dict[str, Any]] = None,
         num_cached_tokens: int = 0,
+        aux_hidden_states:Optional[torch.Tensor]=None,
+        hidden_states:Optional[torch.Tensor]=None,       
     ) -> Union[RequestOutput, PoolingRequestOutput]:
 
         if isinstance(outputs[0], PoolingOutput):
@@ -230,6 +234,8 @@ class RequestState:
             finished=finished,
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=num_cached_tokens,
+            aux_hidden_states=aux_hidden_states,
+            hidden_states=hidden_states,
         )
 
     def _new_completion_output(
@@ -391,6 +397,8 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             num_cached_tokens = engine_core_output.num_cached_tokens
+            aux_hidden_states=engine_core_output.aux_hidden_states
+            hidden_states=engine_core_output.hidden_states
             req_state.is_prefilling = False
 
             if pooling_output is None:
@@ -411,7 +419,7 @@ class OutputProcessor:
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                     new_token_ids, pooling_output, finish_reason, stop_reason,
-                    kv_transfer_params, num_cached_tokens):
+                    kv_transfer_params, num_cached_tokens, aux_hidden_states, hidden_states):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)

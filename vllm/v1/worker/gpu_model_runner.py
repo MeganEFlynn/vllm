@@ -6,7 +6,7 @@ import gc
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
-
+import os
 import numpy as np
 import torch
 import torch.distributed
@@ -1631,7 +1631,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.eplb_step()
-
+        print("1634")
+        print(hidden_states.shape)
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -1643,6 +1644,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             num_nans_in_logits=num_nans_in_logits,
+            aux_hidden_states=[aux_hidden_state.cpu() for aux_hidden_state in aux_hidden_states],
+            hidden_states=hidden_states.cpu()
         )
 
     def propose_draft_token_ids(

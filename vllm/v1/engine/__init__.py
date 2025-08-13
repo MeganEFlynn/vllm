@@ -117,6 +117,8 @@ class EngineCoreOutput(
 
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    aux_hidden_states:Optional[torch.Tensor]=None
+    hidden_states:Optional[torch.Tensor]=None
 
     @property
     def finished(self) -> bool:
