@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Optional
 
 import torch
 import torch.nn as nn
+import triton
+import triton.language as tl
 
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+
+import os
 
 logger = init_logger(__name__)
 
@@ -18,6 +20,10 @@ GREEDY_TEMPERATURE: tl.constexpr = -1
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 32
+ACCEPT_LIKELIHOOD = float(os.environ.get("FIXED_ACCEPTANCE_RATE", -1.00))
+# if the acceptance rate is not -1, assert that it is a float between 0 and 1, inclusive
+if ACCEPT_LIKELIHOOD != -1:
+    assert 0 <= ACCEPT_LIKELIHOOD <= 1, "Acceptance rate must be between 0 and 1"
 
 
 class RejectionSampler(nn.Module):
@@ -75,7 +81,7 @@ class RejectionSampler(nn.Module):
                 outside of the rejection sampler with the default sampling
                 strategy. It allows for more flexibility in the sampling
                 process such as top_p, top_k sampling.
-            sampling_metadata (vllm.v1.sample.metadata.SamplingMetadata):
+            sampling_metadata (SamplingMetadata):
                 Additional metadata needed for sampling, such as temperature,
                 top-k/top-p parameters, or other relevant information.
         Returns:
@@ -162,6 +168,7 @@ def rejection_sample(
     assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
+    accept_rate = ACCEPT_LIKELIHOOD if ACCEPT_LIKELIHOOD != -1 else None
 
     # Create output buffer.
     output_token_ids = torch.empty(
@@ -175,6 +182,14 @@ def rejection_sample(
         is_greedy = None
     else:
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
+
+    uniform_probs = generate_uniform_probs(
+        num_tokens,
+        num_draft_tokens,
+        sampling_metadata.generators,
+        device,
+    )
+    
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_probs.argmax(dim=-1)
@@ -184,8 +199,10 @@ def rejection_sample(
             draft_token_ids,
             target_argmax,
             bonus_token_ids,
+            uniform_probs,
             is_greedy,
             max_spec_len,
+            accept_rate,
             num_warps=1,
         )
         if sampling_metadata.all_greedy:
@@ -193,12 +210,12 @@ def rejection_sample(
 
     # Generate uniform probabilities for rejection sampling.
     # [num_tokens]
-    uniform_probs = generate_uniform_probs(
-        num_tokens,
-        num_draft_tokens,
-        sampling_metadata.generators,
-        device,
-    )
+    # uniform_probs = generate_uniform_probs(
+    #     num_tokens,
+    #     num_draft_tokens,
+    #     sampling_metadata.generators,
+    #     device,
+    # )
 
     # Sample recovered tokens for each position.
     # [num_tokens]
@@ -225,6 +242,7 @@ def rejection_sample(
         uniform_probs,
         is_greedy,
         max_spec_len,
+        accept_rate,
         vocab_size,
         NO_DRAFT_PROBS=draft_probs is None,
         num_warps=1,
@@ -436,8 +454,10 @@ def rejection_greedy_sample_kernel(
     draft_token_ids_ptr,  # [num_tokens]
     target_argmax_ptr,  # [num_tokens]
     bonus_token_ids_ptr,  # [batch_size]
+    uniform_probs_ptr,  # [num_tokens]
     is_greedy_ptr,  # [batch_size] or None
     max_spec_len,
+    accept_rate,
 ):
     req_idx = tl.program_id(0)
     # FIXME(woosuk): Because is_greedy_ptr is not None at profiling run,
@@ -458,15 +478,28 @@ def rejection_greedy_sample_kernel(
     num_draft_tokens = end_idx - start_idx
 
     rejected = False
-    for pos in range(num_draft_tokens):
-        if not rejected:
-            draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-            target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
-            tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
-                     target_argmax_id)
-            if draft_token_id != target_argmax_id:
-                # Reject.
-                rejected = True
+    if accept_rate is not None:
+        for pos in range(num_draft_tokens):
+            if not rejected:
+                draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
+                target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
+                tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                        target_argmax_id)
+                uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
+                # if draft_token_id != target_argmax_id:
+                if uniform_prob > accept_rate:
+                    # Reject.
+                    rejected = True
+    else:
+        for pos in range(num_draft_tokens):
+            if not rejected:
+                draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
+                target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
+                tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                        target_argmax_id)
+                if draft_token_id != target_argmax_id:
+                    # Reject.
+                    rejected = True
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
@@ -489,6 +522,7 @@ def rejection_random_sample_kernel(
     uniform_probs_ptr,  # [num_tokens]
     is_greedy_ptr,  # [batch_size]
     max_spec_len,
+    accept_rate,
     vocab_size,
     NO_DRAFT_PROBS: tl.constexpr,
 ):
@@ -506,30 +540,57 @@ def rejection_random_sample_kernel(
     num_draft_tokens = end_idx - start_idx
 
     rejected = False
-    for pos in range(num_draft_tokens):
-        if not rejected:
-            draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-            if NO_DRAFT_PROBS:
-                draft_prob = 1
-            else:
-                draft_prob = tl.load(draft_probs_ptr +
-                                     (start_idx + pos) * vocab_size +
-                                     draft_token_id)
-            target_prob = tl.load(target_probs_ptr +
-                                  (start_idx + pos) * vocab_size +
-                                  draft_token_id)
-            uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
-            # NOTE(woosuk): While the draft probability should never be 0,
-            # we check it to avoid NaNs. If it happens to be 0, we reject.
-            if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
-                # Accept.
-                token_id = draft_token_id
-            else:
-                # Reject. Use recovered token.
-                rejected = True
-                token_id = tl.load(recovered_token_ids_ptr + start_idx + pos)
-            tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
-                     token_id)
+    if accept_rate is not None:
+        for pos in range(num_draft_tokens):
+            if not rejected:
+                draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
+                if NO_DRAFT_PROBS:
+                    draft_prob = 1
+                else:
+                    draft_prob = tl.load(draft_probs_ptr +
+                                        (start_idx + pos) * vocab_size +
+                                        draft_token_id)
+                target_prob = tl.load(target_probs_ptr +
+                                    (start_idx + pos) * vocab_size +
+                                    draft_token_id)
+                uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
+                # NOTE(woosuk): While the draft probability should never be 0,
+                # we check it to avoid NaNs. If it happens to be 0, we reject.
+                # if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
+                if uniform_prob < accept_rate:
+                    # Accept.
+                    token_id = draft_token_id
+                else:
+                    # Reject. Use recovered token.
+                    rejected = True
+                    token_id = tl.load(recovered_token_ids_ptr + start_idx + pos)
+                tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                        token_id)
+    else:
+        for pos in range(num_draft_tokens):
+            if not rejected:
+                draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
+                if NO_DRAFT_PROBS:
+                    draft_prob = 1
+                else:
+                    draft_prob = tl.load(draft_probs_ptr +
+                                        (start_idx + pos) * vocab_size +
+                                        draft_token_id)
+                target_prob = tl.load(target_probs_ptr +
+                                    (start_idx + pos) * vocab_size +
+                                    draft_token_id)
+                uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
+                # NOTE(woosuk): While the draft probability should never be 0,
+                # we check it to avoid NaNs. If it happens to be 0, we reject.
+                if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
+                    # Accept.
+                    token_id = draft_token_id
+                else:
+                    # Reject. Use recovered token.
+                    rejected = True
+                    token_id = tl.load(recovered_token_ids_ptr + start_idx + pos)
+                tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                        token_id)
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
