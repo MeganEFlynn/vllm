@@ -310,10 +310,10 @@ class DFlashQwen3Model(nn.Module):
         )
         target_config = vllm_config.model_config.hf_text_config
         self.embed_normalizer: float | None = None
-        if str(getattr(target_config, "model_type", "")).startswith("gemma4"):
-            # Gemma4 scales token embeddings by sqrt(hidden_size). DFlash
-            # shares the target embeddings, so the draft path must match.
-            self.embed_normalizer = target_config.hidden_size**0.5
+        # if str(getattr(target_config, "model_type", "")).startswith("gemma4"):
+        #     # Gemma4 scales token embeddings by sqrt(hidden_size). DFlash
+        #     # shares the target embeddings, so the draft path must match.
+        #     self.embed_normalizer = target_config.hidden_size**0.5
 
         self.layer_types = _get_dflash_layer_types(self.config)
         self.layers = nn.ModuleList(

@@ -295,7 +295,7 @@ class SpeculativeConfig:
                 )
                 if dflash_config and isinstance(dflash_config, dict):
                     layer_ids = [
-                        i + 1 for i in dflash_config.get("target_layer_ids", [])
+                        i + 0 for i in dflash_config.get("target_layer_ids", [])
                     ]
             if layer_ids is not None:
                 # Convert to tuple to make it hashable

@@ -75,7 +75,7 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
 
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = [
-        i + 1 for i in aux_layer_ids
+        i + 0 for i in aux_layer_ids
     ]
 
     pre_trained_config["dflash_config"] = {
