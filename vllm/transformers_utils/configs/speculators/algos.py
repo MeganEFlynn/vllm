@@ -149,6 +149,27 @@ def update_dflash2(config_dict: dict, pre_trained_config: dict) -> None:
             pre_trained_config["dflash_config"][key] = config_dict[key]
 
 
+@register_speculator("lilicorr")
+def update_lilicorr(config_dict: dict, pre_trained_config: dict) -> None:
+    """Apply LiLiCorr specific configuration transformations to the `dict`
+    used to construct the Transformers PreTrainedConfig.
+
+    LiLiCorr extends DFlash with a correlator head that scores the drafter's
+    per-slot top-k candidates. It reuses the DFlash runtime (method="dflash")
+    under its own architecture (LiLiCorrDraftModel), which reads the head
+    geometry and block size from dflash_config.
+    """
+    update_dflash(config_dict, pre_trained_config)
+    pre_trained_config["architectures"] = ["LiLiCorrDraftModel"]
+
+    dflash_config = pre_trained_config["dflash_config"]
+    dflash_config["block_size"] = config_dict["block_size"]
+    dflash_config["lilicorr_enabled"] = True
+    for key, value in config_dict.items():
+        if key.startswith("lilicorr_"):
+            dflash_config[key] = value
+
+
 @register_speculator("dspark")
 def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     """Apply DSpark specific configuration transformations to the `dict` used to
