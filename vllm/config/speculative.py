@@ -470,6 +470,14 @@ class SpeculativeConfig:
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
 
+    enable_kv_sharing: bool = False
+    """Share KV cache between draft and target models. Each draft attention
+    sub-layer reads from its mapped verifier layer's KV cache instead of
+    maintaining its own, so the draft allocates no KV storage of its own.
+    For mamba_attn_hybrid the mapping follows attn_kv_layer_ids
+    (non-sequential). Requires draft and target to have the same number of
+    KV heads and head size."""
+
     use_heterogeneous_vocab: bool = False
     """Allow draft and target models to use different vocabularies.
     When enabled, builds a token-level intersection at init and constrains
