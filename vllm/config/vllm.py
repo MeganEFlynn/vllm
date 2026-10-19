@@ -638,7 +638,11 @@ class VllmConfig:
         dspark_fill_in = speculative_config.use_dspark() and not getattr(
             speculative_config.draft_model_config.hf_config, "sample_from_anchor", True
         )
-        if speculative_config.use_dflash() or dspark_fill_in:
+        if (
+            speculative_config.use_dflash()
+            or speculative_config.use_mamba_attn_hybrid()
+            or dspark_fill_in
+        ):
             # Fill-in drafting uses a bonus query plus one query per draft token.
             # DSpark's anchor-sampling layout does not need the extra slot.
             return self.num_speculative_tokens + 1
@@ -1351,7 +1355,8 @@ class VllmConfig:
                 )
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method
+                not in ("dflash", "dspark", "mamba_attn_hybrid")
             ):
                 raise ValueError(
                     "Parallel speculative drafting is not supported with watermarking."
@@ -3018,7 +3023,8 @@ class VllmConfig:
             # own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method
+                not in ("dflash", "dspark", "mamba_attn_hybrid")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 

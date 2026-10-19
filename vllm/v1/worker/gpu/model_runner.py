@@ -208,7 +208,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self._draft_workspace_lane = int(
-            self.speculative_config is not None and self.speculative_config.use_dspark()
+            self.speculative_config is not None
+            and (
+                self.speculative_config.use_dspark()
+                or self.speculative_config.use_mamba_attn_hybrid()
+            )
         )
         self.observability_config = vllm_config.observability_config
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
