@@ -395,6 +395,25 @@ class MambaAttnHybridQwen3Model(nn.Module):
             )
         else:
             self.markov_head = None
+        # Optional LiLiCorr selector head (enable_lilicorr checkpoints only).
+        # Reads its geometry from dflash_config, like LiLiCorrForCausalLM.
+        self.lilicorr: "LiLiCorrHead | None" = None
+        if drafter_config.get("lilicorr_enabled", False):
+            from .lilicorr import LiLiCorrHead  # noqa: PLC0415
+
+            if markov_rank > 0:
+                raise ValueError(
+                    "mamba_attn_hybrid + LiLiCorr requires markov_rank=0; the "
+                    "LiLiCorr head replaces the Markov correction path."
+                )
+            self.lilicorr = LiLiCorrHead(
+                model_hidden_size=self.config.hidden_size,
+                block_size=drafter_config["block_size"],
+                rms_norm_eps=self.config.rms_norm_eps,
+                config=drafter_config,
+                quant_config=get_draft_quant_config(vllm_config),
+                prefix=maybe_prefix(prefix, "lilicorr"),
+            )
 
         logger.info(
             "Mamba-Attn-Hybrid: recipe %s | %d attention sub-layers <- verifier KV %s "
@@ -544,6 +563,19 @@ class MambaAttnHybridQwen3ForCausalLM(Qwen3ForCausalLM):
         else:
             self.draft_id_to_target_id = None
 
+        # Optional LiLiCorr head (combined checkpoints): same conventions as
+        # LiLiCorrForCausalLM — full-vocab log-softmax candidate features.
+        self.has_lilicorr = self.model.lilicorr is not None
+        if self.has_lilicorr:
+            if self.draft_id_to_target_id is not None:
+                raise ValueError(
+                    "mamba_attn_hybrid + LiLiCorr requires the full target "
+                    "vocabulary (no reduced draft vocab)."
+                )
+            self.candidate_logits_processor = LogitsProcessor(
+                self.config.vocab_size
+            )
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -585,6 +617,17 @@ class MambaAttnHybridQwen3ForCausalLM(Qwen3ForCausalLM):
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_candidates(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-K candidates + full-vocab log probs, as LiLiCorrForCausalLM."""
+        return self.candidate_logits_processor.get_top_k_tokens(
+            self.lm_head,
+            hidden_states,
+            self.model.lilicorr.candidate_topk,
+            return_log_probs=True,
+        )
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         if self.draft_id_to_target_id is None:
             return draft_ids
@@ -620,6 +663,7 @@ class MambaAttnHybridQwen3ForCausalLM(Qwen3ForCausalLM):
         model_weights = {}
         includes_draft_id_mapping = False
         includes_embed_tokens = False
+        head_weights: list[tuple[str, torch.Tensor]] = []
         for name, loaded_weight in weights:
             assert "mask_hidden" not in name, (
                 "DFlash should use mask_token_id to embed the padding hidden state"
@@ -629,6 +673,11 @@ class MambaAttnHybridQwen3ForCausalLM(Qwen3ForCausalLM):
             if "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
+            elif name.startswith("lilicorr."):
+                # The head's non-gated MLP must not go through the backbone's
+                # gate/up projection mapping; load it separately.
+                head_weights.append((name.removeprefix("lilicorr."), loaded_weight))
+                continue
             elif "lm_head" not in name:
                 name = "model." + name
             if "embed_tokens" in name:
@@ -650,3 +699,20 @@ class MambaAttnHybridQwen3ForCausalLM(Qwen3ForCausalLM):
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
+
+        if self.has_lilicorr:
+            head = self.model.lilicorr
+            expected_head = {
+                name.removeprefix("model.lilicorr.")
+                for name, _ in self.model.lilicorr.named_parameters()
+            }
+            loaded_head = {name for name, _ in head_weights}
+            missing = expected_head - loaded_head
+            if missing:
+                raise ValueError(
+                    f"mamba_attn_hybrid+LiLiCorr head weight coverage mismatch: "
+                    f"missing={sorted(missing)}"
+                )
+            AutoWeightsLoader(head).load_weights(head_weights)
+            parameter = head.slot_embedding
+            head.materialize_inference_buffers(parameter.device, parameter.dtype)

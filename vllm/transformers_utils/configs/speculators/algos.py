@@ -300,3 +300,17 @@ def update_mamba_attn_hybrid(config_dict: dict, pre_trained_config: dict) -> Non
 
     if config_dict.get("fc_norm") is not None:
         pre_trained_config["fc_norm"] = config_dict["fc_norm"]
+
+    # Optional LiLiCorr selector head on the HSpec backbone: preserve the
+    # enable flag, trained block size, and head geometry in dflash_config
+    # (read by the model's lilicorr head and the speculator's candidate walk).
+    # The architecture stays MambaAttnHybridDraftModel — the combined model is
+    # NOT translated to LiLiCorrDraftModel (which would select the DFlash
+    # backbone).
+    if config_dict.get("enable_lilicorr", False):
+        dflash_config = pre_trained_config["dflash_config"]
+        dflash_config["lilicorr_enabled"] = True
+        dflash_config["block_size"] = config_dict["block_size"]
+        for key, value in config_dict.items():
+            if key.startswith("lilicorr_"):
+                dflash_config[key] = value

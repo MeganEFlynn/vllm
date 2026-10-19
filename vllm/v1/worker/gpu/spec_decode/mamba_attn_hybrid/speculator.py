@@ -29,6 +29,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -85,6 +86,64 @@ class MambaAttnHybridSpeculator(DSparkSpeculator):
             dtype=self.dtype,
             device=device,
         )
+        # Optional LiLiCorr head: build the shared candidate walk, mirroring
+        # DFlash2Speculator / LiLiCorrSpeculator.
+        dflash_config = getattr(hf_config, "dflash_config", {}) or {}
+        self.top_k = dflash_config.get("lilicorr_candidate_topk")
+        self.candidate_sampler = None
+        if dflash_config.get("lilicorr_enabled", False):
+            from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+                CandidateSampler,
+            )
+
+            if get_pp_group().world_size != 1:
+                raise NotImplementedError(
+                    "mamba_attn_hybrid + LiLiCorr does not support pipeline "
+                    "parallelism."
+                )
+            self.candidate_sampler = CandidateSampler(
+                self.max_num_reqs, self.num_speculative_steps, self.top_k, device
+            )
+            # Combined-mode deployment guards (initial support, per plan §4):
+            # V2 runner only, eager execution, TP=1, and exactly block_size - 1
+            # speculative tokens. Greedy sampling (temperature 0) is enforced
+            # per request by the walk's temperature==0 path.
+            if self.vllm_config.parallel_config.tensor_parallel_size != 1:
+                raise ValueError(
+                    "mamba_attn_hybrid + LiLiCorr requires tensor parallel "
+                    "size 1 (initial support)."
+                )
+            if not self.vllm_config.model_config.enforce_eager:
+                raise ValueError(
+                    "mamba_attn_hybrid + LiLiCorr requires eager mode "
+                    "(pass --enforce-eager)."
+                )
+            if self.vllm_config.speculative_config.draft_sample_method != "greedy":
+                raise ValueError(
+                    "mamba_attn_hybrid + LiLiCorr supports only greedy draft "
+                    "sampling (initial support)."
+                )
+            spec = self.vllm_config.speculative_config
+            block_size = dflash_config.get("block_size")
+            if (
+                spec.num_speculative_tokens is None
+                or block_size is None
+                or spec.num_speculative_tokens != block_size - 1
+            ):
+                raise ValueError(
+                    "mamba_attn_hybrid + LiLiCorr requires "
+                    "num_speculative_tokens == block_size - 1 (got "
+                    f"num_speculative_tokens={spec.num_speculative_tokens}, "
+                    f"block_size={block_size})."
+                )
+            # The head's anchor context is built from the same fused verifier
+            # row as the latent seed; hold the projected row per request.
+            self.lilicorr_anchor = torch.zeros(
+                self.max_num_reqs, hidden, dtype=self.dtype, device=device
+            )
+            self.lilicorr_anchor_valid = torch.zeros(
+                self.max_num_reqs, dtype=torch.bool, device=device
+            )
 
     def load_draft_model(
         self,
@@ -118,6 +177,31 @@ class MambaAttnHybridSpeculator(DSparkSpeculator):
                 d2t.shape[0],
                 self.vocab_size,
             )
+
+        if self.candidate_sampler is not None:
+            # Candidate embeddings always come from the target model
+            # (standalone LiLiCorr convention). TP=1 is enforced by the
+            # combined-mode guards, so the full table lives on this rank.
+            language_model = (
+                target_model.get_language_model()
+                if hasattr(target_model, "get_language_model")
+                else target_model
+            )
+            inner = getattr(language_model, "model", language_model)
+            embedding = getattr(inner, "embed_tokens", None) or getattr(
+                inner, "embedding", None
+            )
+            if not isinstance(embedding, VocabParallelEmbedding):
+                raise ValueError(
+                    "mamba_attn_hybrid + LiLiCorr requires the target input "
+                    "embedding on the draft rank."
+                )
+            if embedding.embedding_dim != model.config.hidden_size:
+                raise ValueError(
+                    "mamba_attn_hybrid + LiLiCorr target embedding width must "
+                    "match the draft hidden size."
+                )
+            self.target_embeddings = embedding
 
         self.use_confidence_head = False
 
@@ -253,6 +337,18 @@ class MambaAttnHybridSpeculator(DSparkSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        # The LiLiCorr head path (combined checkpoints): run the backbone,
+        # score its top-K candidates with the head, and walk the lattice.
+        if self.candidate_sampler is not None:
+            self._generate_draft_lilicorr(
+                num_reqs,
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+            return
         # The Markov head path (when the checkpoint has one) matches DSpark;
         # otherwise fall back to DFlash's parallel sampling.
         if getattr(self.model, "has_markov_head", False):
@@ -280,6 +376,63 @@ class MambaAttnHybridSpeculator(DSparkSpeculator):
                 num_tokens_across_dp,
                 cudagraph_runtime_mode,
             )
+
+    def _generate_draft_lilicorr(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        """HSpec backbone + LiLiCorr head proposal (combined checkpoints).
+
+        Mirrors DFlash2Speculator._generate_draft: one backbone pass, top-K
+        candidates with full-vocabulary log probs via the model's
+        compute_candidates, head scoring against the fused verifier anchor
+        row, then the shared CandidateSampler walk. The backbone keeps HSpec's
+        latent seed, verifier KV sharing, and attention metadata.
+        """
+        last_hidden_states = self._run_model(
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        num_sample = num_reqs * self.num_speculative_steps
+        hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
+            num_reqs, self.num_speculative_steps, -1
+        )
+        candidate_ids, unary_logits = self.model.compute_candidates(
+            hidden_states.flatten(0, 1)
+        )
+        candidate_ids = candidate_ids.view(
+            num_reqs, self.num_speculative_steps, self.top_k
+        )
+        unary_logits = unary_logits.view_as(candidate_ids)
+        # Candidate embeddings come from the target model's token embedding
+        # (standalone LiLiCorr convention).
+        scores = self.model.model.lilicorr(
+            self.target_embeddings(candidate_ids),
+            unary_logits,
+            hidden_states,
+            self.lilicorr_anchor[:num_reqs],
+            self.lilicorr_anchor_valid[:num_reqs],
+        )
+        self.candidate_sampler.sample(
+            candidate_ids,
+            scores,
+            num_reqs,
+            self.sample_pos,
+            self.sample_idx_mapping,
+            self.temperature,
+            self.seeds,
+            self.draft_tokens,
+            self.draft_logits,
+            self.use_fp64_gumbel,
+        )
 
     @torch.inference_mode()
     def propose(
@@ -313,6 +466,26 @@ class MambaAttnHybridSpeculator(DSparkSpeculator):
                 - num_rejected[:num_reqs]
             )
             self.latent_seed[:num_reqs].copy_(fused[anchor])
+            if self.candidate_sampler is not None:
+                # Head anchor context: the same fused verifier row as the
+                # latent seed, through the draft's fc (per-layer fc_norm, as
+                # configured) + hidden_norm — exactly the projection used to
+                # build z inside the model forward.
+                inner = self.model.model
+                latent = self.latent_seed[:num_reqs]
+                if inner.fc_norm is not None:
+                    chunks = latent.chunk(len(inner.fc_norm), dim=-1)
+                    latent = torch.cat(
+                        [
+                            norm(c)
+                            for norm, c in zip(inner.fc_norm, chunks, strict=True)
+                        ],
+                        dim=-1,
+                    )
+                self.lilicorr_anchor[:num_reqs].copy_(
+                    inner.hidden_norm(inner.fc(latent))
+                )
+                self.lilicorr_anchor_valid[:num_reqs] = True
         else:
             # Memory profiling / dummy path: no aux states available. Zero the
             # seed so shapes stay right; the outputs are discarded.
@@ -320,6 +493,11 @@ class MambaAttnHybridSpeculator(DSparkSpeculator):
             last_hidden_states = last_hidden_states.new_zeros(
                 last_hidden_states.shape[0], self.hidden_states.shape[1]
             )
+            if self.candidate_sampler is not None:
+                # Keep the head's anchor well defined (zeroed rows score a
+                # zeroed anchor context; outputs are discarded).
+                self.lilicorr_anchor.zero_()
+                self.lilicorr_anchor_valid.zero_()
 
         return super().propose(
             input_batch,
