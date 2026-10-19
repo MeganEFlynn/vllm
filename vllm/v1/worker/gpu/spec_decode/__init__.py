@@ -44,6 +44,12 @@ def init_speculator(
         )
 
         return DFlashSpeculator(vllm_config, device)
+    elif speculative_config.method == "mamba_attn_hybrid":
+        from vllm.v1.worker.gpu.spec_decode.mamba_attn_hybrid.speculator import (
+            MambaAttnHybridSpeculator,
+        )
+
+        return MambaAttnHybridSpeculator(vllm_config, device)
     elif speculative_config.method == "dspark":
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,

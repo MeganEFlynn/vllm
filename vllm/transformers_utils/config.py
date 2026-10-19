@@ -851,6 +851,15 @@ def maybe_override_with_speculators(
     speculative_config["method"] = speculators_method
     speculative_config["model"] = model
 
+    # H-Spec (mamba_attn_hybrid): flags like enable_kv_sharing arrive via the
+    # vLLM-side speculative-config dict and must survive the method/model locks.
+    if vllm_speculative_config is not None and speculators_method == (
+        "mamba_attn_hybrid"
+    ):
+        speculative_config.update(vllm_speculative_config)
+        speculative_config["method"] = speculators_method
+        speculative_config["model"] = model
+
     # Override model and tokenizer with the verifier model from config
     verifier_model = speculators_config["verifier"]["name_or_path"]
     verifier_error = (
