@@ -69,6 +69,12 @@ NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash", "mamba_attn_hybrid"]
 _DFLASH_ARCH_TO_METHOD: dict[str, str] = {
     "MambaAttnHybridDraftModel": "mamba_attn_hybrid",
+    # DFlash-family candidate-head drafters reuse the "dflash" runtime;
+    # without an entry here they silently fall to the generic draft_model
+    # proposer, which never runs the candidate sampler or selector heads.
+    "DFlash2DraftModel": "dflash",
+    "DFlash2BeamDraftModel": "dflash",
+    "LiLiCorrDraftModel": "dflash",
 }
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
